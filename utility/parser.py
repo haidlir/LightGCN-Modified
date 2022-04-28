@@ -33,6 +33,12 @@ def parse_args():
                         help='Output sizes of every layer')
     parser.add_argument('--batch_size', type=int, default=1024,
                         help='Batch size.')
+    parser.add_argument('--alpha_size', nargs='?', default='[16]',
+                        help='MLP layers of alpha configurator')
+    parser.add_argument('--alpha_func', nargs='?', default='l2_norm',
+                        help='MLP output function')
+    parser.add_argument('--alpha_init', nargs='?', default='xavier',
+                        help='MLP variable initializer')
 
     parser.add_argument('--regs', nargs='?', default='[1e-5,1e-5,1e-2]',
                         help='Regularizations.')

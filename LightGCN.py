@@ -22,7 +22,8 @@ cpus = [x.name for x in device_lib.list_local_devices() if x.device_type == 'CPU
 class LightGCN(object):
     def __init__(self, data_config, pretrain_data):
         # argument settings
-        self.model_type = 'LightGCN'
+        # self.model_type = 'LightGCN'
+        self.model_type = args.alg_type
         self.adj_type = args.adj_type
         self.alg_type = args.alg_type
         self.pretrain_data = pretrain_data
@@ -38,9 +39,16 @@ class LightGCN(object):
         self.n_layers = len(self.weight_size)
         self.regs = eval(args.regs)
         self.decay = self.regs[0]
-        self.log_dir=self.create_model_str()
+        # self.log_dir=self.create_model_str()
         self.verbose = args.verbose
         self.Ks = eval(args.Ks)
+        # alpha conf
+        self.alpha_size = eval(args.alpha_size)
+        self.alpha_size = self.alpha_size + [self.n_layers+1]
+        self.alpha_func = args.alpha_func
+        self.alpha_init = args.alpha_init
+        # delayed create model string
+        self.log_dir=self.create_model_str()
 
 
         '''
@@ -128,6 +136,9 @@ class LightGCN(object):
         elif self.alg_type in ['gcmc']:
             self.ua_embeddings, self.ia_embeddings = self._create_gcmc_embed()
 
+        elif self.alg_type in ['adaptive-lightgcn']:
+            self.ua_embeddings, self.ia_embeddings = self._create_adaptive_lightgcn_embed()
+
         """
         *********************************************************
         Establish the final representations for user-item pairs in batch.
@@ -158,14 +169,22 @@ class LightGCN(object):
     
     
     def create_model_str(self):
-        log_dir = '/' + self.alg_type+'/layers_'+str(self.n_layers)+'/dim_'+str(self.emb_dim)
-        log_dir+='/'+args.dataset+'/lr_' + str(self.lr) + '/reg_' + str(self.decay)
+        if self.alg_type == 'adaptive-lightgcn':
+            log_dir = '/' + self.alg_type+'/layers_'+str(self.n_layers)+'/hidden_'+str(self.alpha_size[0])
+            log_dir+='/'+self.alpha_func+'/init_' + self.alpha_init + '/'+args.dataset
+        else:
+            log_dir = '/' + self.alg_type+'/layers_'+str(self.n_layers)+'/dim_'+str(self.emb_dim)
+            log_dir+='/'+args.dataset+'/lr_' + str(self.lr) + '/reg_' + str(self.decay)
         return log_dir
 
 
     def _init_weights(self):
         all_weights = dict()
         initializer = tf.random_normal_initializer(stddev=0.01) #tf.contrib.layers.xavier_initializer()
+        alpha_initializer = tf.contrib.layers.xavier_initializer()
+        if self.alpha_init == 'random_normal':
+            alpha_initializer = tf.random_normal_initializer(stddev=0.01)
+
         if self.pretrain_data is None:
             all_weights['user_embedding'] = tf.Variable(initializer([self.n_users, self.emb_dim]), name='user_embedding')
             all_weights['item_embedding'] = tf.Variable(initializer([self.n_items, self.emb_dim]), name='item_embedding')
@@ -195,7 +214,20 @@ class LightGCN(object):
             all_weights['b_mlp_%d' % k] = tf.Variable(
                 initializer([1, self.weight_size_list[k+1]]), name='b_mlp_%d' % k)
 
+        # alpha configurator weight
+        alpha_num_layers = len(self.alpha_size)
+        for k in range(alpha_num_layers):
+            if k == 0:
+                input_dim = self.emb_dim
+            else:
+                input_dim = self.alpha_size[k-1]
+            all_weights['W_alpha_%d' %k] = tf.Variable(
+                initializer([input_dim, self.alpha_size[k]]), name='W_alpha_%d' % k)
+            all_weights['b_alpha_%d' %k] = tf.Variable(
+                initializer([1, self.alpha_size[k]]), name='b_alpha_%d' % k)
+
         return all_weights
+
     def _split_A_hat(self, X):
         A_fold_hat = []
 
@@ -226,6 +258,43 @@ class LightGCN(object):
             A_fold_hat.append(self._dropout_sparse(temp, 1 - self.node_dropout[0], n_nonzero_temp))
 
         return A_fold_hat
+
+    def _create_adaptive_lightgcn_embed(self):
+        if self.node_dropout_flag:
+            A_fold_hat = self._split_A_hat_node_dropout(self.norm_adj)
+        else:
+            A_fold_hat = self._split_A_hat(self.norm_adj)
+        
+        ego_embeddings = tf.concat([self.weights['user_embedding'], self.weights['item_embedding']], axis=0)
+        all_embeddings = [ego_embeddings]
+
+        # alpha configurator
+        alphas = all_embeddings
+        for k in range(len(self.alpha_size)):
+            alphas = tf.nn.leaky_relu(tf.matmul(alphas, self.weights['W_alpha_%d' % k]) + self.weights['b_alpha_%d' % k])
+        if self.alpha_func == 'l2_norm':
+            alphas = tf.nn.l2_normalize(alphas, axis=2)
+        elif self.alpha_func == 'softmax':
+            alphas = tf.nn.softmax(alphas, axis=2)
+        elif self.alpha_func == 'max_norm':
+            max_per_node = tf.reduce_max(tf.math.abs(alphas), axis=2)
+            max_per_node = tf.tile(tf.expand_dims(max_per_node, axis=-1), [1, 1, self.n_layers+1])
+            alphas = alphas/max_per_node
+        alphas = tf.squeeze(alphas)
+        alphas = tf.expand_dims(alphas, axis=1)
+
+        for k in range(0, self.n_layers):
+            temp_embed = []
+            for f in range(self.n_fold):
+                temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], ego_embeddings))
+
+            side_embeddings = tf.concat(temp_embed, 0)
+            ego_embeddings = side_embeddings
+            all_embeddings += [ego_embeddings]
+        all_embeddings=tf.stack(all_embeddings,1)
+        all_embeddings = tf.squeeze(tf.matmul(alphas, all_embeddings))
+        u_g_embeddings, i_g_embeddings = tf.split(all_embeddings, [self.n_users, self.n_items], 0)
+        return u_g_embeddings, i_g_embeddings
 
     def _create_lightgcn_embed(self):
         if self.node_dropout_flag:
@@ -269,8 +338,6 @@ class LightGCN(object):
             side_embeddings = tf.concat(temp_embed, 0)
             sum_embeddings = tf.nn.leaky_relu(tf.matmul(side_embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
 
-
-
             # bi messages of neighbors.
             bi_embeddings = tf.multiply(ego_embeddings, side_embeddings)
             # transformed bi messages of neighbors.
@@ -289,7 +356,6 @@ class LightGCN(object):
         all_embeddings = tf.concat(all_embeddings, 1)
         u_g_embeddings, i_g_embeddings = tf.split(all_embeddings, [self.n_users, self.n_items], 0)
         return u_g_embeddings, i_g_embeddings
-    
     
     def _create_gcn_embed(self):
         A_fold_hat = self._split_A_hat(self.norm_adj)
@@ -469,8 +535,10 @@ if __name__ == '__main__':
 
     if args.save_flag == 1:
         layer = '-'.join([str(l) for l in eval(args.layer_size)])
-        weights_save_path = '%sweights/%s/%s/%s/l%s_r%s' % (args.weights_path, args.dataset, model.model_type, layer,
-                                                            str(args.lr), '-'.join([str(r) for r in eval(args.regs)]))
+        # weights_save_path = '%sweights/%s/%s/%s/l%s_r%s' % (args.weights_path, args.dataset, model.model_type, layer,
+        #                                                     str(args.lr), '-'.join([str(r) for r in eval(args.regs)]))
+        weights_save_path = '%sweights/%s/%s/%s/%s/%s/%s' % (args.weights_path, args.dataset, model.model_type, layer,
+                                                            eval(args.alpha_size)[0], args.alpha_func, args.alpha_init)
         ensureDir(weights_save_path)
         save_saver = tf.train.Saver(max_to_keep=1)
 
@@ -485,9 +553,10 @@ if __name__ == '__main__':
     if args.pretrain == 1:
         layer = '-'.join([str(l) for l in eval(args.layer_size)])
 
-        pretrain_path = '%sweights/%s/%s/%s/l%s_r%s' % (args.weights_path, args.dataset, model.model_type, layer,
-                                                        str(args.lr), '-'.join([str(r) for r in eval(args.regs)]))
-
+        # pretrain_path = '%sweights/%s/%s/%s/l%s_r%s' % (args.weights_path, args.dataset, model.model_type, layer,
+        #                                                 str(args.lr), '-'.join([str(r) for r in eval(args.regs)]))
+        pretrain_path = '%sweights/%s/%s/%s/%s/%s/%s' % (args.weights_path, args.dataset, model.model_type, layer,
+                                                        eval(args.alpha_size)[0], args.alpha_func, args.alpha_init)
 
         ckpt = tf.train.get_checkpoint_state(os.path.dirname(pretrain_path + '/checkpoint'))
         if ckpt and ckpt.model_checkpoint_path:
@@ -530,10 +599,14 @@ if __name__ == '__main__':
          
         report_path = '%sreport/%s/%s.result' % (args.proj_path, args.dataset, model.model_type)
         ensureDir(report_path)
-        f = open(report_path, 'w')
+        f = open(report_path, 'a')
+        # f.write(
+        #     'embed_size=%d, lr=%.4f, layer_size=%s, keep_prob=%s, regs=%s, loss_type=%s, adj_type=%s\n'
+        #     % (args.embed_size, args.lr, args.layer_size, args.keep_prob, args.regs, args.loss_type, args.adj_type))
+
         f.write(
-            'embed_size=%d, lr=%.4f, layer_size=%s, keep_prob=%s, regs=%s, loss_type=%s, adj_type=%s\n'
-            % (args.embed_size, args.lr, args.layer_size, args.keep_prob, args.regs, args.loss_type, args.adj_type))
+            'layer_size=%s, alpha_size=%s, alpha_func=%s, alpha_init=%s\n'
+            % (args.layer_size, eval(args.alpha_size)[0], args.alpha_func, args.alpha_init))
 
         for i, users_to_test in enumerate(users_to_test_list):
             ret = test(sess, model, users_to_test, drop_flag=True)
@@ -711,7 +784,7 @@ if __name__ == '__main__':
     f = open(save_path, 'a')
 
     f.write(
-        'embed_size=%d, lr=%.4f, layer_size=%s, node_dropout=%s, mess_dropout=%s, regs=%s, adj_type=%s\n\t%s\n'
-        % (args.embed_size, args.lr, args.layer_size, args.node_dropout, args.mess_dropout, args.regs,
-           args.adj_type, final_perf))
+            'layer_size=%s, alpha_size=%s, alpha_func=%s, alpha_init=%s\n\t%s\n'
+            % (args.layer_size, eval(args.alpha_size)[0], args.alpha_func, args.alpha_init, final_perf)
+           )
     f.close()
