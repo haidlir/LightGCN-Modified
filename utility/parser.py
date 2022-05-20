@@ -39,6 +39,8 @@ def parse_args():
                         help='MLP output function')
     parser.add_argument('--alpha_init', nargs='?', default='xavier',
                         help='MLP variable initializer')
+    parser.add_argument('--alpha_dropout', nargs='?', default='[0.1]',
+                        help='Keep probability w.r.t. alpha dropout (i.e., 1-dropout_ratio) for each hidden layer. 1: no dropout.')
 
     parser.add_argument('--regs', nargs='?', default='[1e-5,1e-5,1e-2]',
                         help='Regularizations.')

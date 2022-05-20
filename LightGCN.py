@@ -63,6 +63,8 @@ class LightGCN(object):
         self.node_dropout_flag = args.node_dropout_flag
         self.node_dropout = tf.placeholder(tf.float32, shape=[None])
         self.mess_dropout = tf.placeholder(tf.float32, shape=[None])
+        # Additional dropout placeholder
+        self.alpha_dropout = tf.placeholder(tf.float32, shape=[None])
         with tf.name_scope('TRAIN_LOSS'):
             self.train_loss = tf.placeholder(tf.float32)
             tf.summary.scalar('train_loss', self.train_loss)
@@ -260,10 +262,7 @@ class LightGCN(object):
         return A_fold_hat
 
     def _create_adaptive_lightgcn_embed(self):
-        if self.node_dropout_flag:
-            A_fold_hat = self._split_A_hat_node_dropout(self.norm_adj)
-        else:
-            A_fold_hat = self._split_A_hat(self.norm_adj)
+        A_fold_hat = self._split_A_hat(self.norm_adj)
         
         ego_embeddings = tf.concat([self.weights['user_embedding'], self.weights['item_embedding']], axis=0)
         all_embeddings = [ego_embeddings]
@@ -272,6 +271,8 @@ class LightGCN(object):
         alphas = all_embeddings
         for k in range(len(self.alpha_size)):
             alphas = tf.nn.leaky_relu(tf.matmul(alphas, self.weights['W_alpha_%d' % k]) + self.weights['b_alpha_%d' % k])
+            if self.node_dropout_flag and k < len(self.alpha_size)-1:
+                alphas = tf.nn.dropout(alphas, rate=self.alpha_dropout[0])
         if self.alpha_func == 'l2_norm':
             alphas = tf.nn.l2_normalize(alphas, axis=2)
         elif self.alpha_func == 'softmax':
@@ -473,6 +474,7 @@ class train_thread(threading.Thread):
         users, pos_items, neg_items = self.sample.data
         self.data = sess.run([self.model.opt, self.model.loss, self.model.mf_loss, self.model.emb_loss, self.model.reg_loss],
                                 feed_dict={model.users: users, model.pos_items: pos_items,
+                                            model.alpha_dropout: eval(args.alpha_dropout),
                                             model.node_dropout: eval(args.node_dropout),
                                             model.mess_dropout: eval(args.mess_dropout),
                                             model.neg_items: neg_items})
@@ -489,6 +491,7 @@ class train_thread_test(threading.Thread):
         self.data = sess.run([self.model.loss, self.model.mf_loss, self.model.emb_loss],
                                 feed_dict={model.users: users, model.pos_items: pos_items,
                                         model.neg_items: neg_items,
+                                        model.alpha_dropout: eval(args.alpha_dropout),
                                         model.node_dropout: eval(args.node_dropout),
                                         model.mess_dropout: eval(args.mess_dropout)})       
 

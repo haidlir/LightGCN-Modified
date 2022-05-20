@@ -49,6 +49,7 @@ def test(sess, model, users_to_test, drop_flag=False, train_set_flag=0):
         else:
             rate_batch = sess.run(model.batch_ratings, {model.users: user_batch,
                                                         model.pos_items: item_batch,
+                                                        model.alpha_dropout: [0.],
                                                         model.node_dropout: [0.] * len(eval(args.layer_size)),
                                                         model.mess_dropout: [0.] * len(eval(args.layer_size))})
         rate_batch = np.array(rate_batch)# (B, N)
